@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+
+# Load configuration
+CONFIG_FILE="$HOME/.config/media2cloud.conf"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "No config file found at $CONFIG_FILE"
+  exit 1
+fi
+source "$CONFIG_FILE"
+
+# Check if required commands are installed
+if ! command -v rclone &>/dev/null; then
+  echo "Error: rclone is not installed or not in PATH."
+  exit 1
+fi
+
+if ! command -v exiftool &>/dev/null; then
+  echo "Error: exiftool is not installed or not in PATH."
+  exit 1
+fi
+
+# Check required variables from config file
+if [[ -z "$RCLONE_REMOTE" || -z "$RCLONE_CONF" || -z "$REMOTE_BASE_PATH" || ${#SOURCES[@]} -eq 0 || -z "$MAX_JOBS" ]]; then
+  echo "Missing essential configuration variables in $CONFIG_FILE"
+  exit 1
+fi
+
+# Default flags
+DRY_RUN=false
+KEEP_SOURCE=false
+
+# Allow overriding config variables
+while (( "$#" )); do
+  case "$1" in
+    --help)
+      echo "Usage: ./media2cloud [OPTIONS]"
+      echo "Copies or moves media files to a remote location using rclone."
+      echo
+      echo "Options:"
+      echo "  --help                    Show this help and exit."
+      echo "  --dry-run                 Perform a test run without applying changes."
+      echo "  --keep-source             Use rclone copy instead of rclone move."
+      echo "  --rclone-conf=PATH        Path to rclone configuration file."
+      echo "  --rclone-remote=NAME      Rclone remote name (without colon)."
+      echo "  --remote-base-path=PATH   Set the base path on the remote."
+      exit 0
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      ;;
+    --keep-source)
+      KEEP_SOURCE=true
+      ;;
+    --rclone-conf=*)
+      RCLONE_CONF="${1#*=}"
+      ;;
+    --rclone-remote=*)
+      RCLONE_REMOTE="${1#*=}"
+      ;;
+    --remote-base-path=*)
+      REMOTE_BASE_PATH="${1#*=}"
+      ;;
+    *)
+      # Ignore unknown args or parse more if needed
+      ;;
+  esac
+  shift
+done
+
+# Function to determine year/month from EXIF or file system metadata
+get_date_folder() {
+  local file="$1"
+  local exif_date
+  exif_date=$(exiftool -s3 -DateTimeOriginal "$file" 2>/dev/null | sed 's/:/-/3')
+  if [[ -n "$exif_date" ]]; then
+    local year month
+    year=$(echo "$exif_date" | cut -d':' -f1)
+    month=$(echo "$exif_date" | cut -d':' -f2)
+    echo "$year/$month"
+    return
+  fi
+
+  local mod_date
+  mod_date=$(stat -c %y "$file" 2>/dev/null | cut -d'-' -f1-2 | sed 's/-/ /')
+  if [[ -n "$mod_date" ]]; then
+    local year month
+    year=$(echo "$mod_date" | awk '{print $1}')
+    month=$(echo "$mod_date" | awk '{print $2}')
+    echo "$year/$month"
+  else
+    echo "unknown_date"
+  fi
+}
+
+# Initialize counters for summary
+files_moved=0
+errors=0
+
+for source_dir in "${SOURCES[@]}"; do
+  [[ ! -d "$source_dir" ]] && continue
+
+  # Collect multimedia files only
+  mapfile -t FILES < <(
+    find "$source_dir" -type f \( \
+      -iname '*.jpg' -o \
+      -iname '*.jpeg' -o \
+      -iname '*.png' -o \
+      -iname '*.gif' -o \
+      -iname '*.bmp' -o \
+      -iname '*.mp4' -o \
+      -iname '*.mov' -o \
+      -iname '*.mkv' -o \
+      -iname '*.mp3' -o \
+      -iname '*.wav' -o \
+      -iname '*.aac' -o \
+      -iname '*.cr2' -o \
+      -iname '*.nef' -o \
+      -iname '*.arw' -o \
+      -iname '*.rw2' -o \
+      -iname '*.webp' -o \
+      -iname '*.dng' -o \
+      -iname '*.raf' -o \
+      -iname '*.heic' -o \
+      -iname '*.heif' \
+    \)
+  )
+
+  total_files="${#FILES[@]}"
+  count=1
+  active_jobs=0
+
+  for file in "${FILES[@]}"; do
+    date_folder=$(get_date_folder "$file")
+    remote_path="${RCLONE_REMOTE}:/$REMOTE_BASE_PATH/$date_folder"
+
+    echo "[${count}/${total_files}] Processing: $file -> $remote_path"
+
+    (
+      if [[ "$DRY_RUN" == true ]]; then
+        echo "[${count}/${total_files}] DRY RUN: rclone move \"$file\" \"$remote_path\" --config=\"$RCLONE_CONF\" --checksum --skip-links"
+      else
+        if [[ "$KEEP_SOURCE" == true ]]; then
+          # Run rclone copy and suppress stdout, capture stderr
+          error_message=$(rclone copy "$file" "$remote_path" \
+            --config="$RCLONE_CONF" \
+            --checksum \
+            --skip-links 2>&1 >/dev/null)
+
+          if [[ $? -ne 0 ]]; then
+            echo "[${count}/${total_files}] Error copying file: $file"
+            echo "rclone error: $error_message"
+            ((errors++))
+          else
+            echo "[${count}/${total_files}] Successfully copied file: $file"
+            ((files_moved++))
+          fi
+
+        else
+          # Run rclone move and suppress stdout, capture stderr
+          error_message=$(rclone move "$file" "$remote_path" \
+            --config="$RCLONE_CONF" \
+            --checksum \
+            --skip-links 2>&1 >/dev/null)
+
+          if [[ $? -ne 0 ]]; then
+            echo "[${count}/${total_files}] Error moving file: $file"
+            echo "rclone error: $error_message"
+            ((errors++))
+          else
+            echo "[${count}/${total_files}] Successfully moved file: $file"
+            ((files_moved++))
+          fi
+        fi
+      fi
+    ) &
+
+    ((count++))
+    ((active_jobs++))
+    if (( active_jobs >= MAX_JOBS )); then
+      wait -n
+      ((active_jobs--))
+    fi
+  done
+
+  wait
+done
+
+# Display summary
+echo "Processing completed."
+echo "Files successfully moved/copied: $files_moved"
+echo "Errors encountered: $errors"
