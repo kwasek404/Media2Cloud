@@ -92,10 +92,6 @@ get_date_folder() {
   fi
 }
 
-# Initialize counters for summary
-files_moved=0
-errors=0
-
 for source_dir in "${SOURCES[@]}"; do
   [[ ! -d "$source_dir" ]] && continue
 
@@ -140,35 +136,27 @@ for source_dir in "${SOURCES[@]}"; do
         echo "[${count}/${total_files}] DRY RUN: rclone move \"$file\" \"$remote_path\" --config=\"$RCLONE_CONF\" --checksum --skip-links"
       else
         if [[ "$KEEP_SOURCE" == true ]]; then
-          # Run rclone copy and suppress stdout, capture stderr
-          error_message=$(rclone copy "$file" "$remote_path" \
+          rclone copy "$file" "$remote_path" \
             --config="$RCLONE_CONF" \
             --checksum \
-            --skip-links 2>&1 >/dev/null)
+            --skip-links > /dev/null
 
           if [[ $? -ne 0 ]]; then
-            echo "[${count}/${total_files}] Error copying file: $file"
-            echo "rclone error: $error_message"
-            ((errors++))
+            echo "[${count}/${total_files}] Error copying file: $file" >&2
           else
             echo "[${count}/${total_files}] Successfully copied file: $file"
-            ((files_moved++))
           fi
 
         else
-          # Run rclone move and suppress stdout, capture stderr
-          error_message=$(rclone move "$file" "$remote_path" \
+          rclone move "$file" "$remote_path" \
             --config="$RCLONE_CONF" \
             --checksum \
-            --skip-links 2>&1 >/dev/null)
+            --skip-links > /dev/null
 
           if [[ $? -ne 0 ]]; then
-            echo "[${count}/${total_files}] Error moving file: $file"
-            echo "rclone error: $error_message"
-            ((errors++))
+            echo "[${count}/${total_files}] Error moving file: $file" >&2
           else
             echo "[${count}/${total_files}] Successfully moved file: $file"
-            ((files_moved++))
           fi
         fi
       fi
@@ -184,8 +172,3 @@ for source_dir in "${SOURCES[@]}"; do
 
   wait
 done
-
-# Display summary
-echo "Processing completed."
-echo "Files successfully moved/copied: $files_moved"
-echo "Errors encountered: $errors"
